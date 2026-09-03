@@ -589,10 +589,9 @@ def _grouped_a8w4_tdm_moe(
         _row_to_token = torch.full(
             (int(contiguous_m),), -1, dtype=torch.int32, device=device
         )
-    # Align expert starts to the larger of the two tile heights: gemm2 may tile M
-    # more coarsely than gemm1 (it also runs the EP scatter, which shifts its
-    # optimum), and a start aligned only to tile_m would let a gemm2 tile cross an
-    # expert boundary.
+    # _align_m, not tile_m: gemm2 may tile M more coarsely than gemm1, and a
+    # start aligned only to tile_m would let a gemm2 tile cross an expert
+    # boundary (see the divisibility check above).
     _starts, psum, _ = contiguous_psum_remap(
         _masked_m,
         topids_to_rows,
