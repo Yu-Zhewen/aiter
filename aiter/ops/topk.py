@@ -480,6 +480,11 @@ _FLYDSL_TOPK_DECODE_KS = (512, 1024, 2048, 4096)
 # which was fitted for the chunked kernel, so the two cannot share bands. Both
 # are read against the HIP kernel, not against the FlyDSL path they replace.
 # The SILOTIGER-699 gfx950 early-stop investigation holds the per-cell ratios.
+#
+# NOT FINAL. These bands came from a sweep that varied the live length inside a
+# fixed 1M buffer, while this table is keyed on the physical width, so a padded
+# buffer can be admitted on a band it was never measured at. Re-fit from a
+# width x seq sweep, as the earlier regate did, before relying on them.
 _FLYDSL_TOPK_DECODE_GATES_ADAPTIVE = {
     "gfx950": {
         True: (
