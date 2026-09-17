@@ -494,7 +494,14 @@ _FLYDSL_TOPK_DECODE_GATES_ADAPTIVE = {
         ),
     },
 }
-_FLYDSL_TOPK_DECODE_ADAPTIVE_KS = (256, 512, 1024, 2048)
+# k=4096 is ordered-only here. It wins every band above by 1.4x to 35x when the
+# emit is ordered, and loses the unordered 256-row and 512-row cells of widths
+# 65536 to 262144, down to 0.68x, which no band above can exclude without being
+# split per k.
+_FLYDSL_TOPK_DECODE_ADAPTIVE_KS = {
+    True: (256, 512, 1024, 2048, 4096),
+    False: (256, 512, 1024, 2048),
+}
 
 
 def _in_bands(bands, width: int, num_rows: int) -> bool:
@@ -519,7 +526,7 @@ def _flydsl_topk_decode_shape_supported(
     if (
         adaptive is not None
         and indices_only  # the adaptive kernel does not emit values
-        and k in _FLYDSL_TOPK_DECODE_ADAPTIVE_KS
+        and k in _FLYDSL_TOPK_DECODE_ADAPTIVE_KS[stable]
         and _in_bands(adaptive[stable], width, num_rows)
     ):
         return True

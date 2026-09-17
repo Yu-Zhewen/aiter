@@ -28,8 +28,9 @@ _ONE_WORKGROUP_MAX_ROW_WIDTH = 20_000
 _ADAPTIVE_ARCHES = ("gfx950",)
 
 # The k values the sweeps cover. The kernel builds at any k; an unmeasured one
-# keeps the chunked path rather than shipping an unmeasured kernel.
-_ADAPTIVE_KS = (256, 512, 1024, 2048)
+# keeps the chunked path rather than shipping an unmeasured kernel. Which shapes
+# reach here at each k is the gate's decision, not this one's.
+_ADAPTIVE_KS = (256, 512, 1024, 2048, 4096)
 
 
 @lru_cache(maxsize=8)
