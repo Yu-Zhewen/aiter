@@ -1543,24 +1543,39 @@ namespace py = pybind11;
           py::arg("softmax_scale"));
 
 #define PA_MQA_LOGITS_MXFP4_GFX1250_PYBIND               \
-    m.def("pa_mqa_logits_mxfp4_gfx1250_fwd_prefill",     \
-          &pa_mqa_logits_mxfp4_gfx1250_fwd_prefill,      \
+    m.def("pa_mqa_logits_mxfp4_gfx1250_fwd_sched",       \
+          &pa_mqa_logits_mxfp4_gfx1250_fwd_sched,        \
           py::arg("q"),                                  \
           py::arg("q_scale"),                            \
           py::arg("kv_cache"),                           \
           py::arg("kv_scale"),                           \
           py::arg("block_tables"),                       \
           py::arg("weights"),                            \
-          py::arg("row_to_batch"),                       \
           py::arg("local_starts"),                       \
           py::arg("local_ends"),                         \
-          py::arg("group_starts"),                       \
+          py::arg("cta_info"),                           \
           py::arg("out"),                                \
           py::arg("num_rows"),                           \
-          py::arg("num_groups"),                         \
+          py::arg("num_ctas"),                           \
           py::arg("weight_scale"),                       \
           py::arg("kv_block_size"),                      \
           py::arg("max_seq_len"));                       \
+    m.def("pa_mqa_logits_mxfp4_gfx1250_build_tiles",     \
+          &pa_mqa_logits_mxfp4_gfx1250_build_tiles,      \
+          py::arg("cu_seq_q"),                           \
+          py::arg("cu_tiles"),                           \
+          py::arg("total_q"),                            \
+          py::arg("max_tiles"));                         \
+    m.def("pa_mqa_logits_mxfp4_gfx1250_build_sched",     \
+          &pa_mqa_logits_mxfp4_gfx1250_build_sched,      \
+          py::arg("cu_tiles"),                           \
+          py::arg("local_starts"),                       \
+          py::arg("local_ends"),                         \
+          py::arg("row_to_batch"),                       \
+          py::arg("cta_info"),                           \
+          py::arg("num_tiles"),                          \
+          py::arg("num_ctas"),                           \
+          py::arg("cta_resident"));                      \
     m.def("pa_mqa_logits_mxfp4_gfx1250_prefill_windows", \
           &pa_mqa_logits_mxfp4_gfx1250_prefill_windows,  \
           py::arg("cu_seq_q"),                           \
@@ -1568,13 +1583,7 @@ namespace py = pybind11;
           py::arg("row_to_batch"),                       \
           py::arg("local_starts"),                       \
           py::arg("local_ends"),                         \
-          py::arg("total_q"));                           \
-    m.def("pa_mqa_logits_mxfp4_gfx1250_prefill_groups",  \
-          &pa_mqa_logits_mxfp4_gfx1250_prefill_groups,   \
-          py::arg("cu_seq_q"),                           \
-          py::arg("group_starts"),                       \
-          py::arg("total_q"),                            \
-          py::arg("max_groups"));
+          py::arg("total_q"));
 
 #define FMHA_FWD_BF16_OPUS_PYBIND                   \
     m.def("fmha_fwd_bf16_opus_fwd",                 \

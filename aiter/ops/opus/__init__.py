@@ -48,14 +48,15 @@ if _arch_ok:
 
     # gfx1250-only, unlike the gemm entries above: _SUPPORTED is wider than this kernel, so the
     # wrapper re-checks at call time rather than at import. Only the arch-qualified names are
-    # re-exported here -- the module's generic helpers (compute_prefill_windows,
-    # compute_prefill_groups, assert_qshare_windows) stay behind
+    # re-exported here -- the module's generic helpers (compute_tiles, compute_schedule,
+    # compute_prefill_windows, assert_qshare_windows, sched_slots) stay behind
     # `aiter.ops.opus.pa_mqa_logits_gfx1250_opus`, because a gfx950 sibling of this op wants the
     # same generic names and two arches cannot both own one.
     from .pa_mqa_logits_gfx1250_opus import (
-        pa_mqa_logits_mxfp4_gfx1250_fwd_prefill,
-        pa_mqa_logits_mxfp4_gfx1250_prefill,
-        pa_mqa_logits_mxfp4_gfx1250_prefill_groups,
+        pa_mqa_logits_mxfp4_gfx1250,
+        pa_mqa_logits_mxfp4_gfx1250_build_sched,
+        pa_mqa_logits_mxfp4_gfx1250_build_tiles,
+        pa_mqa_logits_mxfp4_gfx1250_fwd_sched,
         pa_mqa_logits_mxfp4_gfx1250_prefill_windows,
     )
 
@@ -82,14 +83,17 @@ else:
     opus_gemm_workspace_release_all = _make_unsupported_arch_stub(
         "opus_gemm_workspace_release_all"
     )
-    pa_mqa_logits_mxfp4_gfx1250_fwd_prefill = _make_unsupported_arch_stub(
-        "pa_mqa_logits_mxfp4_gfx1250_fwd_prefill"
+    pa_mqa_logits_mxfp4_gfx1250 = _make_unsupported_arch_stub(
+        "pa_mqa_logits_mxfp4_gfx1250"
     )
-    pa_mqa_logits_mxfp4_gfx1250_prefill = _make_unsupported_arch_stub(
-        "pa_mqa_logits_mxfp4_gfx1250_prefill"
+    pa_mqa_logits_mxfp4_gfx1250_build_sched = _make_unsupported_arch_stub(
+        "pa_mqa_logits_mxfp4_gfx1250_build_sched"
     )
-    pa_mqa_logits_mxfp4_gfx1250_prefill_groups = _make_unsupported_arch_stub(
-        "pa_mqa_logits_mxfp4_gfx1250_prefill_groups"
+    pa_mqa_logits_mxfp4_gfx1250_build_tiles = _make_unsupported_arch_stub(
+        "pa_mqa_logits_mxfp4_gfx1250_build_tiles"
+    )
+    pa_mqa_logits_mxfp4_gfx1250_fwd_sched = _make_unsupported_arch_stub(
+        "pa_mqa_logits_mxfp4_gfx1250_fwd_sched"
     )
     pa_mqa_logits_mxfp4_gfx1250_prefill_windows = _make_unsupported_arch_stub(
         "pa_mqa_logits_mxfp4_gfx1250_prefill_windows"
@@ -104,8 +108,9 @@ __all__ = [
     "opus_gemm_workspace_init",
     "opus_gemm_workspace_release",
     "opus_gemm_workspace_release_all",
-    "pa_mqa_logits_mxfp4_gfx1250_fwd_prefill",
-    "pa_mqa_logits_mxfp4_gfx1250_prefill",
-    "pa_mqa_logits_mxfp4_gfx1250_prefill_groups",
+    "pa_mqa_logits_mxfp4_gfx1250",
+    "pa_mqa_logits_mxfp4_gfx1250_build_sched",
+    "pa_mqa_logits_mxfp4_gfx1250_build_tiles",
+    "pa_mqa_logits_mxfp4_gfx1250_fwd_sched",
     "pa_mqa_logits_mxfp4_gfx1250_prefill_windows",
 ]

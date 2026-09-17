@@ -124,59 +124,55 @@ static void pa_mqa_logits_mxfp4_gfx1250_check_shapes(aiter_tensor_t& q,
                 num_blocks);
 }
 
+// ── the launch: 1D grid over the schedule table ───────────────────────────────
+// `cta_info` is reused in place, so a captured graph replays from one address. The builder
+// writes every slot, so a previous forward's schedule cannot leak into this one.
 template <class Traits>
-static void pa_mqa_logits_mxfp4_gfx1250_launch_prefill(aiter_tensor_t& q,
-                                                       aiter_tensor_t& q_scale,
-                                                       aiter_tensor_t& kv_cache,
-                                                       aiter_tensor_t& kv_scale,
-                                                       aiter_tensor_t& block_tables,
-                                                       aiter_tensor_t& weights,
-                                                       aiter_tensor_t& row_to_batch,
-                                                       aiter_tensor_t& local_starts,
-                                                       aiter_tensor_t& local_ends,
-                                                       aiter_tensor_t& group_starts,
-                                                       aiter_tensor_t& out,
-                                                       int num_rows,
-                                                       int num_groups,
-                                                       float weight_scale,
-                                                       int kv_block_size,
-                                                       int max_seq_len)
+static void pa_mqa_logits_mxfp4_gfx1250_launch_sched(aiter_tensor_t& q,
+                                                     aiter_tensor_t& q_scale,
+                                                     aiter_tensor_t& kv_cache,
+                                                     aiter_tensor_t& kv_scale,
+                                                     aiter_tensor_t& block_tables,
+                                                     aiter_tensor_t& weights,
+                                                     aiter_tensor_t& local_starts,
+                                                     aiter_tensor_t& local_ends,
+                                                     aiter_tensor_t& cta_info,
+                                                     aiter_tensor_t& out,
+                                                     int num_rows,
+                                                     int num_ctas,
+                                                     float weight_scale,
+                                                     int kv_block_size,
+                                                     int max_seq_len)
 {
     pa_mqa_logits_mxfp4_gfx1250_check_shapes<Traits>(
         q, q_scale, kv_cache, kv_scale, block_tables, weights, out, kv_block_size, max_seq_len);
-    AITER_CHECK(
-        row_to_batch.dtype() == AITER_DTYPE_i32 && local_starts.dtype() == AITER_DTYPE_i32 &&
-            local_ends.dtype() == AITER_DTYPE_i32 && group_starts.dtype() == AITER_DTYPE_i32,
-        "row_to_batch / local_starts / local_ends / group_starts must be int32");
-    AITER_CHECK(row_to_batch.is_contiguous() && local_starts.is_contiguous() &&
-                    local_ends.is_contiguous() && group_starts.is_contiguous(),
-                "row_to_batch / local_starts / local_ends / group_starts must be contiguous");
+    AITER_CHECK(local_ends.dtype() == AITER_DTYPE_i32 && local_ends.is_contiguous(),
+                "local_ends must be contiguous int32");
+    AITER_CHECK(cta_info.dtype() == AITER_DTYPE_i32 && cta_info.is_contiguous(),
+                "cta_info must be contiguous int32");
     AITER_CHECK(num_rows <= q.size(0),
-                "num_rows exceeds the query rows in q: ",
-                num_rows,
-                " > ",
-                q.size(0));
-    AITER_CHECK(static_cast<int64_t>(row_to_batch.numel()) >= num_rows &&
-                    static_cast<int64_t>(local_starts.numel()) >= num_rows &&
-                    static_cast<int64_t>(local_ends.numel()) >= num_rows,
-                "row_to_batch / local_starts / local_ends are per query row; need at least ",
-                num_rows,
-                " entries each, got ",
-                row_to_batch.numel(),
-                " / ",
-                local_starts.numel(),
-                " / ",
+                "num_rows exceeds the query rows in q: ", num_rows, " > ", q.size(0));
+    // The store's upper bound is read PER ROW, so this array is the only thing between a short
+    // allocation and a CTA reading a neighbouring one.
+    AITER_CHECK(static_cast<int64_t>(local_ends.numel()) >= num_rows,
+                "local_ends is per query row; need at least ", num_rows, " entries, got ",
                 local_ends.numel());
-    // Group g reads BOTH group_starts[g] and group_starts[g + 1], so the array is one longer
-    // than the grid. Under-sized, a CTA reads a neighbouring allocation and walks whatever row
-    // range that dword implies -- in bounds for the hardware, wrong for the answer.
-    AITER_CHECK(static_cast<int64_t>(group_starts.numel()) >= (int64_t)num_groups + 1,
-                "group_starts holds one boundary per group PLUS a terminator; need at least ",
-                num_groups + 1,
-                " entries, got ",
-                group_starts.numel());
+    AITER_CHECK(num_ctas > 0, "num_ctas must be >= 1, got ", num_ctas);
+    AITER_CHECK(static_cast<int64_t>(cta_info.numel()) >= (int64_t)num_ctas * 8,
+                "cta_info holds 8 int32 per CTA slot; need ", (int64_t)num_ctas * 8,
+                " for num_ctas=", num_ctas, ", got numel=", cta_info.numel(),
+                ". Size it with aiter.ops.opus.pa_mqa_logits_mxfp4_gfx1250_sched_buffer_ints()");
 
-    if(num_rows <= 0 || num_groups <= 0)
+    const int* p_ls = nullptr;
+    if(local_starts.numel() > 0)
+    {
+        AITER_CHECK(local_starts.dtype() == AITER_DTYPE_i32 && local_starts.is_contiguous() &&
+                        static_cast<int64_t>(local_starts.numel()) >= num_rows,
+                    "local_starts, when given, must be contiguous int32 with one entry per row");
+        p_ls = reinterpret_cast<const int*>(local_starts.data_ptr());
+    }
+
+    if(num_rows <= 0)
         return;
 
     opus_mqa_logits_kargs kargs{};
@@ -187,11 +183,11 @@ static void pa_mqa_logits_mxfp4_gfx1250_launch_prefill(aiter_tensor_t& q,
     kargs.ptr_block_tables = reinterpret_cast<const int*>(block_tables.data_ptr());
     kargs.ptr_weights      = weights.data_ptr();
     kargs.ptr_out          = reinterpret_cast<float*>(out.data_ptr());
-    kargs.ptr_row_to_batch = reinterpret_cast<const int*>(row_to_batch.data_ptr());
-    kargs.ptr_local_starts = reinterpret_cast<const int*>(local_starts.data_ptr());
+    // The per-row STORE MASK. The loop bound comes from the record's union instead.
+    kargs.ptr_local_starts = p_ls;
     kargs.ptr_local_ends   = reinterpret_cast<const int*>(local_ends.data_ptr());
-    // The kernel's `cu_seq_q` is the qshare GROUP boundary array, not the batch one.
-    kargs.ptr_cu_seq_q       = reinterpret_cast<const int*>(group_starts.data_ptr());
+    kargs.ptr_cta_info = reinterpret_cast<const opus_mqa_cta_record*>(cta_info.data_ptr());
+    kargs.num_ctas           = num_ctas;
     kargs.num_rows           = num_rows;
     kargs.max_seq_len        = max_seq_len;
     kargs.stride_out_row     = static_cast<int>(out.stride(0));
@@ -203,50 +199,36 @@ static void pa_mqa_logits_mxfp4_gfx1250_launch_prefill(aiter_tensor_t& q,
     HipDeviceGuard guard(q.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    dim3 grid(static_cast<unsigned>(num_groups)); // one CTA per qshare group
+    dim3 grid(static_cast<unsigned>(num_ctas)); // one CTA per schedule slot
     dim3 block(Traits::BLOCK_SIZE);
     opus_logits::qshare::
-        mqa_logits_mxfp4_32x16x128_qshare_kernel<Traits, opus_logits::mqa_logits_sched::Prefill>
+        mqa_logits_mxfp4_32x16x128_qshare_kernel<Traits, opus_logits::mqa_logits_sched::Table>
         <<<grid, block, 0, stream>>>(kargs);
     HIP_CALL_LAUNCH(hipGetLastError());
 }
 
-void pa_mqa_logits_mxfp4_gfx1250_fwd_prefill(aiter_tensor_t& q,
-                                             aiter_tensor_t& q_scale,
-                                             aiter_tensor_t& kv_cache,
-                                             aiter_tensor_t& kv_scale,
-                                             aiter_tensor_t& block_tables,
-                                             aiter_tensor_t& weights,
-                                             aiter_tensor_t& row_to_batch,
-                                             aiter_tensor_t& local_starts,
-                                             aiter_tensor_t& local_ends,
-                                             aiter_tensor_t& group_starts,
-                                             aiter_tensor_t& out,
-                                             int num_rows,
-                                             int num_groups,
-                                             float weight_scale,
-                                             int kv_block_size,
-                                             int max_seq_len)
+void pa_mqa_logits_mxfp4_gfx1250_fwd_sched(aiter_tensor_t& q,
+                                           aiter_tensor_t& q_scale,
+                                           aiter_tensor_t& kv_cache,
+                                           aiter_tensor_t& kv_scale,
+                                           aiter_tensor_t& block_tables,
+                                           aiter_tensor_t& weights,
+                                           aiter_tensor_t& local_starts,
+                                           aiter_tensor_t& local_ends,
+                                           aiter_tensor_t& cta_info,
+                                           aiter_tensor_t& out,
+                                           int num_rows,
+                                           int num_ctas,
+                                           float weight_scale,
+                                           int kv_block_size,
+                                           int max_seq_len)
 {
     // pybind path: make the shape checks throw a Python RuntimeError instead of abort()ing the
     // interpreter. Same convention as opus_gemm.cu / gradlib.
     aiter_detail::g_aiter_can_throw = true;
-    pa_mqa_logits_mxfp4_gfx1250_launch_prefill<mqa_logits_fp4_gfx1250_traits>(q,
-                                                                              q_scale,
-                                                                              kv_cache,
-                                                                              kv_scale,
-                                                                              block_tables,
-                                                                              weights,
-                                                                              row_to_batch,
-                                                                              local_starts,
-                                                                              local_ends,
-                                                                              group_starts,
-                                                                              out,
-                                                                              num_rows,
-                                                                              num_groups,
-                                                                              weight_scale,
-                                                                              kv_block_size,
-                                                                              max_seq_len);
+    pa_mqa_logits_mxfp4_gfx1250_launch_sched<mqa_logits_fp4_gfx1250_traits>(
+        q, q_scale, kv_cache, kv_scale, block_tables, weights, local_starts, local_ends,
+        cta_info, out, num_rows, num_ctas, weight_scale, kv_block_size, max_seq_len);
 }
 
 // Both builders take and return caller-allocated device buffers: no hipMalloc, no host<->device
@@ -298,66 +280,6 @@ __global__ void mqa_logits_fp4_gfx1250_prefill_windows_kernel(const int* __restr
     row_to_batch[r] = b;
     local_starts[r] = 0;
     local_ends[r]   = le;
-}
-
-// ONE workgroup, because the group offsets are a prefix sum over batches and a second kernel
-// would need a second buffer for it. B is a batch count and this runs once per forward.
-constexpr int GROUPS_BUILD_BLOCK     = 256;
-constexpr int GROUPS_BUILD_MAX_BATCH = 2048; // 8 KB of LDS for the offsets
-
-__global__ void mqa_logits_fp4_gfx1250_prefill_groups_kernel(
-    const int* __restrict__ cu, int* __restrict__ group_starts, int B, int max_groups, int qpb)
-{
-    __shared__ int g_off[GROUPS_BUILD_MAX_BATCH + 1];
-
-    for(int b = threadIdx.x; b < B; b += blockDim.x)
-        g_off[b] = (cu[b + 1] - cu[b] + qpb - 1) / qpb;
-    __syncthreads();
-
-    // Exclusive scan, in place, serial on one thread: B <= 2048 and this is a per-forward call,
-    // so the scan is not worth the correctness surface of a parallel one.
-    if(threadIdx.x == 0)
-    {
-        int acc = 0;
-        for(int b = 0; b < B; ++b)
-        {
-            const int c = g_off[b];
-            g_off[b]    = acc;
-            acc += c;
-        }
-        g_off[B] = acc;
-    }
-    __syncthreads();
-
-    const int num_groups = g_off[B];
-    const int end_row    = cu[B];
-
-    // Group g's END needs no write of its own: the groups tile the rows in order, so it is
-    // group_starts[g + 1] -- a batch's last group ends at cu[b + 1], which is where the next
-    // batch's first group starts.
-    //
-    // Groups from num_groups to max_groups inclusive are written end_row, so each is empty and
-    // its CTA returns on `group_end <= group_row`. That is what lets grid.x be a static shape.
-    for(int g = threadIdx.x; g <= max_groups; g += blockDim.x)
-    {
-        if(g >= num_groups)
-        {
-            group_starts[g] = end_row;
-            continue;
-        }
-        // The LARGEST b with g_off[b] <= g, which is what makes an EMPTY batch skip itself: it
-        // has g_off[b] == g_off[b + 1] and loses the tie to b + 1.
-        int lo = 0, hi = B - 1;
-        while(lo < hi)
-        {
-            const int mid = (lo + hi + 1) >> 1;
-            if(g_off[mid] <= g)
-                lo = mid;
-            else
-                hi = mid - 1;
-        }
-        group_starts[g] = cu[lo] + (g - g_off[lo]) * qpb;
-    }
 }
 
 } // namespace
@@ -414,53 +336,172 @@ void pa_mqa_logits_mxfp4_gfx1250_prefill_windows(aiter_tensor_t& cu_seq_q,
     HIP_CALL_LAUNCH(hipGetLastError());
 }
 
-void pa_mqa_logits_mxfp4_gfx1250_prefill_groups(aiter_tensor_t& cu_seq_q,
-                                                aiter_tensor_t& group_starts,
-                                                int total_q,
-                                                int max_groups)
+void pa_mqa_logits_mxfp4_gfx1250_build_tiles(aiter_tensor_t& cu_seq_q,
+                                             aiter_tensor_t& cu_tiles,
+                                             int total_q,
+                                             int max_tiles)
 {
     aiter_detail::g_aiter_can_throw = true;
     constexpr int QPB               = mqa_logits_fp4_gfx1250_traits::Q_PER_BLOCK;
     const int B                     = static_cast<int>(cu_seq_q.size(0)) - 1;
-    AITER_CHECK(cu_seq_q.dtype() == AITER_DTYPE_i32 && group_starts.dtype() == AITER_DTYPE_i32,
-                "cu_seq_q / group_starts must be int32");
-    AITER_CHECK(cu_seq_q.is_contiguous() && group_starts.is_contiguous(),
-                "cu_seq_q / group_starts must be contiguous");
+    AITER_CHECK(cu_seq_q.dtype() == AITER_DTYPE_i32 && cu_tiles.dtype() == AITER_DTYPE_i32,
+                "cu_seq_q / cu_tiles must be int32");
+    AITER_CHECK(cu_seq_q.is_contiguous() && cu_tiles.is_contiguous(),
+                "cu_seq_q / cu_tiles must be contiguous");
     AITER_CHECK(B >= 1, "cu_seq_q must have length batch+1 with batch >= 1, got ", B + 1);
-    AITER_CHECK(B <= GROUPS_BUILD_MAX_BATCH,
-                "the group builder scans the batch prefix in LDS and is capped at ",
-                GROUPS_BUILD_MAX_BATCH,
+    // The scan is serial on one lane and the emit binary-searches it per tile, so the cost grows
+    // with the batch: 3.4 us at B <= 128, 8.9 at B = 512, 32.9 at the cap. Fine for a decode
+    // batch of 128; hundreds of sequences would want a parallel scan first.
+    AITER_CHECK(B <= opus_logits::GROUPS_BUILD_MAX_BATCH,
+                "the tile cut scans the batch prefix in LDS and is capped at ",
+                opus_logits::GROUPS_BUILD_MAX_BATCH,
                 " batches, got ",
                 B);
-    // The kernel writes every g in [0, max_groups], so the array is max_groups + 1 long.
-    AITER_CHECK(static_cast<int64_t>(group_starts.numel()) >= (int64_t)max_groups + 1,
-                "group_starts needs max_groups + 1 = ",
-                max_groups + 1,
+    // The kernel writes every t in [0, max_tiles], so the array is max_tiles + 1 long.
+    AITER_CHECK(static_cast<int64_t>(cu_tiles.numel()) >= (int64_t)max_tiles + 1,
+                "cu_tiles needs max_tiles + 1 = ",
+                max_tiles + 1,
                 " entries, got ",
-                group_starts.numel());
-    // A correctness bound, not a tuning one: a max_groups below the real count silently DROPS
-    // the tail groups, and their rows are then never written.
-    AITER_CHECK((int64_t)max_groups >= ((int64_t)total_q + QPB - 1) / QPB,
-                "max_groups must cover every row; at Q_PER_BLOCK=",
+                cu_tiles.numel());
+    // A correctness bound, not a tuning one: a max_tiles below the real count silently DROPS the
+    // tail tiles, and their rows are then never written.
+    AITER_CHECK((int64_t)max_tiles >= ((int64_t)total_q + QPB - 1) / QPB,
+                "max_tiles must cover every row; at Q_PER_BLOCK=",
                 (int)QPB,
                 " and total_q=",
                 total_q,
                 " it must be at least ",
                 (total_q + QPB - 1) / QPB,
                 ", got ",
-                max_groups);
+                max_tiles);
 
-    if(max_groups <= 0)
+    if(max_tiles <= 0)
         return;
 
     HipDeviceGuard guard(cu_seq_q.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
-    mqa_logits_fp4_gfx1250_prefill_groups_kernel<<<1, GROUPS_BUILD_BLOCK, 0, stream>>>(
+    opus_logits::mqa_logits_build_tiles<<<1, opus_logits::GROUPS_BUILD_BLOCK, 0, stream>>>(
         reinterpret_cast<const int*>(cu_seq_q.data_ptr()),
-        reinterpret_cast<int*>(group_starts.data_ptr()),
+        reinterpret_cast<int*>(cu_tiles.data_ptr()),
         B,
-        max_groups,
+        max_tiles,
         QPB);
+    HIP_CALL_LAUNCH(hipGetLastError());
+}
+
+// Fill `cta_info`. No host<->device sync and nothing read back, so it is capture-safe.
+//
+// `sched_plan` is the policy and lives in the header, so this launcher and the opus-ops
+// standalone host cannot drift on it; only the dispatch is per-host.
+void pa_mqa_logits_mxfp4_gfx1250_build_sched(aiter_tensor_t& cu_tiles,
+                                             aiter_tensor_t& local_starts,
+                                             aiter_tensor_t& local_ends,
+                                             aiter_tensor_t& row_to_batch,
+                                             aiter_tensor_t& cta_info,
+                                             int num_tiles,
+                                             int num_ctas,
+                                             int cta_resident)
+{
+    aiter_detail::g_aiter_can_throw = true;
+    namespace ol                    = opus_logits;
+    AITER_CHECK(cu_tiles.dtype() == AITER_DTYPE_i32 && cu_tiles.is_contiguous(),
+                "cu_tiles must be contiguous int32");
+    AITER_CHECK(local_ends.dtype() == AITER_DTYPE_i32 && local_ends.is_contiguous(),
+                "local_ends must be contiguous int32");
+    AITER_CHECK(cta_info.dtype() == AITER_DTYPE_i32 && cta_info.is_contiguous(),
+                "cta_info must be contiguous int32");
+    AITER_CHECK(num_tiles >= 0, "num_tiles must be >= 0, got ", num_tiles);
+    // Tile t reads BOTH cu_tiles[t] and cu_tiles[t + 1].
+    AITER_CHECK(static_cast<int64_t>(cu_tiles.numel()) >= (int64_t)num_tiles + 1,
+                "cu_tiles holds one boundary per tile PLUS a terminator; need ",
+                num_tiles + 1,
+                ", got ",
+                cu_tiles.numel());
+    // Below this a tile could get no CTA at all and its rows would keep whatever the caller
+    // pre-filled -- silently, since every other row would still be right.
+    AITER_CHECK(num_ctas >= num_tiles,
+                "num_ctas (",
+                num_ctas,
+                ") must be >= num_tiles (",
+                num_tiles,
+                "); use aiter.ops.opus.pa_mqa_logits_mxfp4_gfx1250_sched_slots()");
+    // The BUFFER is `sched_buffer_records(num_ctas)` while the GRID stays `num_ctas`: the
+    // multi-workgroup emit's per-block partials sit past the slots.
+    AITER_CHECK(static_cast<int64_t>(cta_info.numel()) >=
+                    (int64_t)ol::sched_buffer_records(num_ctas) * 8,
+                "cta_info holds 8 int32 per CTA slot plus a ",
+                ol::SCHED_SCRATCH_RECORDS,
+                "-record build scratch; need ",
+                (int64_t)ol::sched_buffer_records(num_ctas) * 8,
+                ", got numel=",
+                cta_info.numel(),
+                ". Size it with "
+                "aiter.ops.opus.pa_mqa_logits_mxfp4_gfx1250_sched_buffer_ints()");
+
+    if(num_tiles == 0 && num_ctas == 0)
+        return;
+
+    const int* p_ls = nullptr;
+    if(local_starts.numel() > 0)
+    {
+        AITER_CHECK(local_starts.dtype() == AITER_DTYPE_i32 && local_starts.is_contiguous(),
+                    "local_starts, when given, must be contiguous int32");
+        p_ls = reinterpret_cast<const int*>(local_starts.data_ptr());
+    }
+    const int* p_rb = nullptr;
+    if(row_to_batch.numel() > 0)
+    {
+        AITER_CHECK(row_to_batch.dtype() == AITER_DTYPE_i32 && row_to_batch.is_contiguous(),
+                    "row_to_batch, when given, must be contiguous int32");
+        p_rb = reinterpret_cast<const int*>(row_to_batch.data_ptr());
+    }
+
+    HipDeviceGuard guard(local_ends.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    const int* p_cut         = reinterpret_cast<const int*>(cu_tiles.data_ptr());
+    const int* p_le          = reinterpret_cast<const int*>(local_ends.data_ptr());
+    auto* p_cta              = reinterpret_cast<opus_mqa_cta_record*>(cta_info.data_ptr());
+    const int block_k        = mqa_logits_fp4_gfx1250_traits::KV_TILE_SIZE;
+
+    const auto plan = ol::sched_plan(num_tiles, num_ctas);
+    if(plan.blocks == 1)
+    {
+        if(plan.block == ol::SCHED_BUILD_BLOCK)
+            ol::mqa_logits_build_sched<ol::SCHED_BUILD_BLOCK>
+                <<<1, ol::SCHED_BUILD_BLOCK, 0, stream>>>(
+                    p_cut, p_ls, p_le, p_rb, p_cta, num_tiles, num_ctas, block_k, cta_resident);
+        else
+            ol::mqa_logits_build_sched<ol::SCHED_BUILD_BLOCK_WIDE>
+                <<<1, ol::SCHED_BUILD_BLOCK_WIDE, 0, stream>>>(
+                    p_cut, p_ls, p_le, p_rb, p_cta, num_tiles, num_ctas, block_k, cta_resident);
+    }
+    else
+    {
+        int* scratch = reinterpret_cast<int*>(p_cta + num_ctas);
+        ol::mqa_logits_build_sched_emit<ol::SCHED_BUILD_BLOCK>
+            <<<plan.blocks, ol::SCHED_BUILD_BLOCK, 0, stream>>>(p_cut,
+                                                                p_ls,
+                                                                p_le,
+                                                                p_rb,
+                                                                p_cta,
+                                                                scratch,
+                                                                num_tiles,
+                                                                num_ctas,
+                                                                block_k,
+                                                                plan.blocks);
+        ol::mqa_logits_build_sched_finish<ol::SCHED_BUILD_BLOCK_WIDE>
+            <<<1, ol::SCHED_BUILD_BLOCK_WIDE, 0, stream>>>(p_cut,
+                                                           p_ls,
+                                                           p_le,
+                                                           p_rb,
+                                                           p_cta,
+                                                           scratch,
+                                                           num_tiles,
+                                                           num_ctas,
+                                                           block_k,
+                                                           cta_resident,
+                                                           plan.blocks);
+    }
     HIP_CALL_LAUNCH(hipGetLastError());
 }

@@ -2,14 +2,21 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // MXFP4 paged MQA logits on gfx1250: wave32, `v_wmma_scale_f32_32x16x128_f4`, TDM, and the KV
-// tile shared across the CTA's query rows. Prefill only.
+// tile shared across the CTA's query rows, driven by a per-tile schedule table.
+//
+// Prefill and decode both run through here; the table says which, by whether its tiles carry a
+// non-zero window start. `pa_mqa_logits_mxfp4_gfx1250_sched.h` builds it.
 //
 // THE CALLER'S CONTRACT IS IN pa_mqa_logits_mxfp4_gfx1250.h and this kernel cannot check any of
-// it. The short version, because two of the three shape the code below: the loop bound is the
-// group's UNION window and is CTA-UNIFORM, the store mask is each wave's OWN row, and nothing
-// in the phase loop may depend on the wave's slot -- make any of it per-row and the kernel does
-// not give a wrong answer, it DEADLOCKS on the phase barrier. Every early return below is on a
-// CTA-uniform condition for that reason.
+// it. The short version, because it shapes the code below: the loop bound is the tile's UNION
+// window and is CTA-UNIFORM, the store mask is each wave's OWN row, and nothing in the phase
+// loop may depend on the wave's slot -- make any of it per-row and the kernel does not give a
+// wrong answer, it DEADLOCKS on the phase barrier. Every early return below is on a CTA-uniform
+// condition for that reason.
+//
+// Keeping those two windows apart is what lets a tile hold rows whose windows merely OVERLAP, so
+// tiles can be cut at a fixed Q_PER_BLOCK rather than on the CSA visibility runs. The
+// run-aligned alternative makes 1.375x to 1.75x more tiles in MTP decode and costs 24-45%.
 #pragma once
 
 #include <opus/opus.hpp>
@@ -48,12 +55,15 @@ __device__ inline float permlane_head_reduce(float v) {
     return std::bit_cast<float>(r[0]) + std::bit_cast<float>(r[1]);
 }
 
-template<class T, mqa_logits_sched SCHED = mqa_logits_sched::Prefill>
+// Grid: one CTA per SCHEDULE SLOT (grid.x == kargs.num_ctas). A slot is a tile of
+// 1..Q_PER_BLOCK query rows and a contiguous run of that tile's KV tiles, so a long window is
+// spread over several CTAs instead of serialising one.
+template<class T, mqa_logits_sched SCHED = mqa_logits_sched::Table>
 __global__ __launch_bounds__(T::BLOCK_SIZE, T::WAVES_PER_EU)
 void mqa_logits_mxfp4_32x16x128_qshare_kernel(opus_mqa_logits_kargs kargs) {
-    static_assert(SCHED == mqa_logits_sched::Prefill,
-                  "Prefill only: decode needs split_kv and the XCD-padded grid, and gfx1250's XCD "
-                  "topology differs from MI355. The ABI already carries every decode field.");
+    static_assert(SCHED == mqa_logits_sched::Table,
+                  "this target compiles the schedule-table mapping and nothing else. Decode needs "
+                  "no separate mapping: a decode table is one whose tiles carry a zero start.");
 
     using D_BYTE  = opus::u8_t;
     using D_SCALE = typename T::D_SCALE;
@@ -86,10 +96,9 @@ void mqa_logits_mxfp4_32x16x128_qshare_kernel(opus_mqa_logits_kargs kargs) {
     float weight_scale = kargs.weight_scale;
     int   max_blk      = kargs.max_blocks_per_seq;
     pin_sgpr(stride_out); pin_sgpr(weight_scale); pin_sgpr(max_blk);
+    const opus_mqa_cta_record* p_cta_info = kargs.ptr_cta_info;
     const int* p_local_starts = kargs.ptr_local_starts;
     const int* p_local_ends   = kargs.ptr_local_ends;
-    const int* p_row_to_batch = kargs.ptr_row_to_batch;
-    const int* p_cu_seq_q     = kargs.ptr_cu_seq_q;
 
     const int tid = opus::thread_id_x();
     // readfirstlane, not a plain shift: the slot is wave-uniform in fact but divergent to LLVM,
@@ -107,24 +116,23 @@ void mqa_logits_mxfp4_32x16x128_qshare_kernel(opus_mqa_logits_kargs kargs) {
     // it runs with own_end = 0, so its out descriptor has zero records and every store it makes
     // is dropped. That is the whole of "short groups are masked, not padded".
     constexpr int kv_tile_size = T::KV_TILE_SIZE;
-    const int group_id  = opus::block_id_x();
-    const int group_row = p_cu_seq_q[group_id];
-    const int group_end = p_cu_seq_q[group_id + 1];
-    if (group_end <= group_row) return;              // CTA-uniform
-    const int  group_rows = group_end - group_row;
-    const bool slot_ok    = q_slot < group_rows;
-    // Clamped, not branched: q_slot is readfirstlane'd and group_rows is an s_load, so the
-    // select is s_cselect and the reads below stay s_load.
-    const int row_id      = group_row + (slot_ok ? q_slot : 0);
-    int       batch_id    = p_row_to_batch[group_row];
-    const int local_start = p_local_starts[group_row];    // union: non-decreasing -> first row
-    const int local_end   = p_local_ends[group_end - 1];  // union: non-decreasing -> last row
-    const int own_start   = p_local_starts[row_id];
+    // The whole assignment in one `s_load_dwordx8` off a blockIdx-uniform address. The
+    // surplus-slot return is CTA-uniform, so it cannot deadlock the phase barrier.
+    const opus_mqa_cta_record rec = p_cta_info[opus::block_id_x()];
+    if (rec.chunk_count <= 0) return;                // surplus, or an empty window
+    const bool slot_ok    = q_slot < rec.group_rows;
+    // Clamped, not branched: q_slot is readfirstlane'd and group_rows comes off the record, so
+    // the select is s_cselect and the row's base addresses below stay scalar.
+    const int row_id      = rec.row_id + (slot_ok ? q_slot : 0);
+    int       batch_id    = rec.batch_id;
+    // The null-starts branch is on a kargs pointer, so it is uniform across the whole grid. The
+    // union start is the right fallback rather than a literal 0: with no starts array every row
+    // starts at 0 and so does the union.
+    const int own_start   = p_local_starts ? p_local_starts[row_id] : rec.local_start;
     const int own_end     = slot_ok ? p_local_ends[row_id] : 0;
+    const int chunk_start = rec.chunk_start;         // ABSOLUTE tile index, not an offset
+    const int tile_count  = rec.chunk_count;
     pin_sgpr(batch_id);
-    const int chunk_start = local_start / kv_tile_size;
-    const int end_kv_tile = (local_end > 0) ? ((local_end + kv_tile_size - 1) / kv_tile_size) : 0;
-    const int tile_count  = end_kv_tile - chunk_start;
 
     const D_BYTE*   q_base  = reinterpret_cast<const D_BYTE*>(p_q) + (size_t)row_id * T::Q_ROW_BYTES;
     const D_SCALE*  qs_base = reinterpret_cast<const D_SCALE*>(p_q_scale) + (size_t)row_id * T::N_HEADS;
@@ -339,7 +347,9 @@ void mqa_logits_mxfp4_32x16x128_qshare_kernel(opus_mqa_logits_kargs kargs) {
         __builtin_amdgcn_sched_barrier(0);
     };
 
-    if (tile_count <= 0) return;
+    // The empty-assignment return has moved up to the record read, where `chunk_count <= 0`
+    // covers both the surplus slot and the empty window -- and covers them BEFORE the TDM
+    // descriptors are built, which the late form did not.
 
     opus::static_for<MT>([&](auto mic) {
         constexpr int mi = mic.value;

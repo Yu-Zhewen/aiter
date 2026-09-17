@@ -39,9 +39,10 @@ from aiter.ops.opus.pa_mqa_logits_gfx1250_opus import (
     BLOCK_K,
     Q_PER_BLOCK,
     assert_qshare_windows,
-    compute_prefill_groups,
     compute_prefill_windows,
-    pa_mqa_logits_mxfp4_gfx1250_prefill,
+    compute_schedule,
+    compute_tiles,
+    pa_mqa_logits_mxfp4_gfx1250,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -299,18 +300,23 @@ def run_one(inp, qlens, rb, ls, le, label, seed, check_windows=True):
     cu = torch.tensor(
         [0] + list(itertools.accumulate(qlens)), dtype=torch.int32, device=dev
     )
-    group_starts, num_groups = compute_prefill_groups(cu, total_q)
+    cu_tiles, num_tiles = compute_tiles(cu, total_q)
     if check_windows:
-        # The two conditions the kernel cannot check. Host-side and synchronising, so it runs
-        # in the correctness path only -- and it is worth running, because breaking them
-        # DEADLOCKS the CTA rather than returning a wrong answer.
-        assert_qshare_windows(group_starts, num_groups, rb, ls, le)
+        # The condition the kernel cannot check. Host-side and synchronising, so it runs in the
+        # correctness path only -- and it is worth running, because breaking it DEADLOCKS the
+        # CTA rather than returning a wrong answer.
+        assert_qshare_windows(cu_tiles, num_tiles, ls, le)
 
-    out = pa_mqa_logits_mxfp4_gfx1250_prefill(
+    # `local_starts` is passed because these cases carry non-zero window starts; ATOM's paths do
+    # not and leave it None. `row_to_batch` is passed because `block_tables` here is per
+    # SEQUENCE -- leaving it None would make the kernel read the table by query row.
+    cta_info, num_ctas = compute_schedule(
+        cu_tiles, le, num_tiles, local_starts=ls, row_to_batch=rb
+    )
+    out = pa_mqa_logits_mxfp4_gfx1250(
         inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
-        inp.weights, rb, ls, le, inp.max_seq_len,
-        groups=(group_starts, num_groups),
-        weight_scale=WEIGHT_SCALE, kv_block_size=KV_BLOCK_SIZE,
+        inp.weights, le, cta_info, num_ctas, inp.max_seq_len,
+        local_starts=ls, weight_scale=WEIGHT_SCALE, kv_block_size=KV_BLOCK_SIZE,
     )  # fmt: skip
     torch.cuda.synchronize()
 
@@ -319,7 +325,7 @@ def run_one(inp, qlens, rb, ls, le, label, seed, check_windows=True):
     oob = oob_is_neginf(out, ls, le)
     wr = window_is_written(out, ls, le)
     return {
-        "case": label, "rows": total_q, "groups": num_groups,
+        "case": label, "rows": total_q, "tiles": num_tiles, "ctas": num_ctas,
         "max_win": int(le.max()), "err": err, "oob -inf": oob,
         "window written": wr, "pass": err == 0 and oob and wr,
     }  # fmt: skip
@@ -486,7 +492,10 @@ def test_prefill_causal(bs):
     )
     ctx = torch.tensor(qlens, dtype=torch.int32, device=dev)
     rb, ls, le = compute_prefill_windows(cu, ctx, total_q)
-    groups = compute_prefill_groups(cu, total_q)
+    # Per FORWARD against a per-layer kernel, so built OUTSIDE the timed region: `run_perftest`
+    # sums every CUDA event in it, so a metadata kernel left inside lands in the reported time.
+    cu_tiles, num_tiles = compute_tiles(cu, total_q)
+    sched = compute_schedule(cu_tiles, le, num_tiles, local_starts=ls, row_to_batch=rb)
     out = torch.full(
         (total_q, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
     )
@@ -495,18 +504,19 @@ def test_prefill_causal(bs):
     # so late binding would read the next shape's buffers. The window arrays and the group
     # boundaries are passed IN because `run_perftest` sums every CUDA event in the region, so a
     # builder left inside the timed call lands in the reported time.
-    def ours(inp=inp, rb=rb, ls=ls, le=le, groups=groups, out=out):
-        return pa_mqa_logits_mxfp4_gfx1250_prefill(
+    def ours(inp=inp, ls=ls, le=le, sched=sched, out=out):
+        return pa_mqa_logits_mxfp4_gfx1250(
             inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
-            inp.weights, rb, ls, le, inp.max_seq_len, groups=groups,
-            weight_scale=WEIGHT_SCALE, kv_block_size=KV_BLOCK_SIZE, out=out,
+            inp.weights, le, sched[0], sched[1], inp.max_seq_len,
+            local_starts=ls, weight_scale=WEIGHT_SCALE, kv_block_size=KV_BLOCK_SIZE, out=out,
         )  # fmt: skip
 
     n_logits = int((le - ls).clamp(min=0).sum().item())
     ret = {
         "gfx": get_gfx(),
         "total_q": total_q,
-        "groups": groups[1],
+        "tiles": num_tiles,
+        "ctas": sched[1],
         "max_win": int(le.max()),
         "n_logits": n_logits,
     }
@@ -541,16 +551,19 @@ def test_prefill_csa(regime, bs, qlen, kvlen):
     cu = torch.tensor(
         [0] + list(itertools.accumulate(qlens)), dtype=torch.int32, device=dev
     )
-    groups = compute_prefill_groups(cu, total_q)
+    # Per FORWARD against a per-layer kernel, so built OUTSIDE the timed region: `run_perftest`
+    # sums every CUDA event in it, so a metadata kernel left inside lands in the reported time.
+    cu_tiles, num_tiles = compute_tiles(cu, total_q)
+    sched = compute_schedule(cu_tiles, le, num_tiles, local_starts=ls, row_to_batch=rb)
     out = torch.full(
         (total_q, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
     )
 
-    def ours(inp=inp, rb=rb, ls=ls, le=le, groups=groups, out=out):
-        return pa_mqa_logits_mxfp4_gfx1250_prefill(
+    def ours(inp=inp, ls=ls, le=le, sched=sched, out=out):
+        return pa_mqa_logits_mxfp4_gfx1250(
             inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
-            inp.weights, rb, ls, le, inp.max_seq_len, groups=groups,
-            weight_scale=WEIGHT_SCALE, kv_block_size=KV_BLOCK_SIZE, out=out,
+            inp.weights, le, sched[0], sched[1], inp.max_seq_len,
+            local_starts=ls, weight_scale=WEIGHT_SCALE, kv_block_size=KV_BLOCK_SIZE, out=out,
         )  # fmt: skip
 
     n_logits = int((le - ls).clamp(min=0).sum().item())
@@ -559,7 +572,8 @@ def test_prefill_csa(regime, bs, qlen, kvlen):
         "regime": regime,
         "bs": bs,
         "qlen": qlen,
-        "groups": groups[1],
+        "tiles": num_tiles,
+        "ctas": sched[1],
         "max_win": int(le.max()),
         "n_logits": n_logits,
     }
