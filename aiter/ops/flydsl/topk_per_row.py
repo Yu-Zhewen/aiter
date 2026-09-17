@@ -17,9 +17,52 @@ from .kernels.topk_per_row_decode import (
 from .kernels.topk_per_row_decode_persistent import (
     build_topk_per_row_decode_one_workgroup_module,
 )
+from .kernels import topk_per_row_decode_adaptive as _adaptive
 
 # Measured crossover between the one-workgroup and multi-kernel paths.
 _ONE_WORKGROUP_MAX_ROW_WIDTH = 20_000
+
+# The arches whose sweep says the adaptive kernel takes every cell of the chunked
+# path it replaces. gfx942 is absent because the sweep that would admit it was
+# taken at a CU count this file cannot assume.
+_ADAPTIVE_ARCHES = ("gfx950",)
+
+# The k values the sweeps cover. The kernel builds at any k; an unmeasured one
+# keeps the chunked path rather than shipping an unmeasured kernel.
+_ADAPTIVE_KS = (256, 512, 1024, 2048)
+
+
+@lru_cache(maxsize=8)
+def _adaptive_cu_count(device_index: int) -> int:
+    """CU count of the device the row will run on, which one arch name spans
+    several of, so the kernel's grid tables cannot take it as a constant."""
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _adaptive_admits(arch: str, k: int, values: torch.Tensor | None) -> bool:
+    """Whether the call is inside the region the adaptive kernel was measured in;
+    `values` is the hard one, because this kernel emits indices only."""
+    return (
+        any(arch.startswith(name) for name in _ADAPTIVE_ARCHES)
+        and k in _ADAPTIVE_KS
+        and values is None
+    )
+
+
+@lru_cache(maxsize=16)
+def _get_cached_adaptive_workspace(
+    device: torch.device, stream_id: int, slots: int
+) -> torch.Tensor:
+    return torch.zeros(slots, device=device, dtype=torch.int32)
+
+
+def _get_adaptive_workspace(
+    device: torch.device, stream_id: int, slots: int
+) -> torch.Tensor:
+    # Do not let graph-pool allocations escape through the process cache.
+    if torch.cuda.is_current_stream_capturing():
+        return torch.zeros(slots, device=device, dtype=torch.int32)
+    return _get_cached_adaptive_workspace(device, stream_id, slots)
 
 
 @lru_cache(maxsize=16)
@@ -303,6 +346,51 @@ def flydsl_top_k_per_row_decode(
             next_n,
             stride0,
             rows,
+            stream,
+        )
+        return
+
+    if _adaptive_admits(arch, k, values):
+        # The config takes the physical width, not a row's live length: seq_lens is
+        # device-resident, so the length is not a host quantity. The kernel folds
+        # each row onto as many of the launch's workgroups as its own length needs.
+        cfg = _adaptive.decode_adaptive_config(
+            rows,
+            width,
+            k,
+            ordered=stable,
+            cu_count=_adaptive_cu_count(logits.device.index),
+        )
+        kw = cfg["kw"]
+        launcher = _adaptive.create_topk_per_row_decode_adaptive_kernel(top_k=k, **kw)
+        workspace = _get_adaptive_workspace(
+            logits.device,
+            stream.cuda_stream,
+            _adaptive.topk_workspace_slots(
+                rows,
+                11,
+                compact=cfg["compact"],
+                compact_cap=kw.get("compact_cap_mult", 16) * k,
+            ),
+        )
+        if _adaptive.needs_workspace_zero(
+            width,
+            k,
+            kw["tiered_short_max"],
+            tier_mode=kw.get("tier_mode", "auto"),
+            bits_per_pass=11,
+        ):
+            workspace.zero_()
+        _run_compiled(
+            launcher,
+            logits,
+            next_n,
+            seq_lens,
+            indices,
+            workspace,
+            rows,
+            stride0,
+            stride1,
             stream,
         )
         return

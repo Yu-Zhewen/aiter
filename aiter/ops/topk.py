@@ -476,6 +476,35 @@ _FLYDSL_TOPK_DECODE_GATES = {
 }
 _FLYDSL_TOPK_DECODE_KS = (512, 1024, 2048, 4096)
 
+# Where the adaptive kernel takes the shape it is wider than the table above,
+# which was fitted for the chunked kernel, so the two cannot share bands. Both
+# are read against the HIP kernel, not against the FlyDSL path they replace.
+# The SILOTIGER-699 gfx950 early-stop investigation holds the per-cell ratios.
+_FLYDSL_TOPK_DECODE_GATES_ADAPTIVE = {
+    "gfx950": {
+        True: (
+            (32_768, 65_535, 32),
+            (65_536, 131_071, 64),
+            (131_072, None, 512),
+        ),
+        False: (
+            (65_536, 131_071, 128),
+            (131_072, 262_143, 256),
+            (262_144, None, 512),
+        ),
+    },
+}
+_FLYDSL_TOPK_DECODE_ADAPTIVE_KS = (256, 512, 1024, 2048)
+
+
+def _in_bands(bands, width: int, num_rows: int) -> bool:
+    return any(
+        min_width <= width
+        and (max_width is None or width <= max_width)
+        and 0 < num_rows <= max_rows
+        for min_width, max_width, max_rows in bands
+    )
+
 
 @functools.lru_cache(maxsize=128)
 def _flydsl_topk_decode_shape_supported(
@@ -484,15 +513,19 @@ def _flydsl_topk_decode_shape_supported(
     width: int,
     num_rows: int,
     k: int,
+    indices_only: bool,
 ) -> bool:
+    adaptive = _FLYDSL_TOPK_DECODE_GATES_ADAPTIVE.get(arch)
+    if (
+        adaptive is not None
+        and indices_only  # the adaptive kernel does not emit values
+        and k in _FLYDSL_TOPK_DECODE_ADAPTIVE_KS
+        and _in_bands(adaptive[stable], width, num_rows)
+    ):
+        return True
     if k not in _FLYDSL_TOPK_DECODE_KS:
         return False
-    return any(
-        min_width <= width
-        and (max_width is None or width <= max_width)
-        and 0 < num_rows <= max_rows
-        for min_width, max_width, max_rows in _FLYDSL_TOPK_DECODE_GATES[arch][stable]
-    )
+    return _in_bands(_FLYDSL_TOPK_DECODE_GATES[arch][stable], width, num_rows)
 
 
 def _should_use_flydsl_topk_decode(
@@ -524,6 +557,7 @@ def _should_use_flydsl_topk_decode(
         logits.shape[1],
         num_rows,
         k,
+        values is None,
     ):
         return False
 

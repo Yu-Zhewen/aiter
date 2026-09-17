@@ -406,12 +406,15 @@ def decode_adaptive_config(
         # waiting workgroup issued on every unsuccessful poll.
         "poll_then_acquire": True,
     }
-    # Off unless asked. Which shapes it wins is measured per card, because what it
-    # saves depends on how many waves the grid takes; earlystop_gfx942_2026-09-16
-    # holds the numbers and FLYDSL_TOPK_COMPACT_ES is how a sweep asks for it.
+    # On unless asked off. Neither card measured has a region that loses, so there
+    # is no row or width term to fit, and on gfx950 it is not optional: the shipped
+    # baseline carries the feature, so a build without it hands back cells at one
+    # row. The SILOTIGER-699 early-stop investigations hold the grids.
     if early_stop is None:
-        early_stop = os.environ.get("FLYDSL_TOPK_COMPACT_ES", "0") not in ("0", "")
-    if early_stop:
+        early_stop = os.environ.get("FLYDSL_TOPK_COMPACT_ES", "1") not in ("0", "")
+    # The factory drops it under `ordered` and `compact`; mirror that here so a
+    # caller reading this config back sees what the kernel will actually build.
+    if early_stop and not ordered and not compact:
         kw["early_stop"] = True
     if decode_adaptive_certificate(seq, parts):
         kw["histogram_certificate"] = True
